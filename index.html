@@ -52,9 +52,9 @@
 </style>
 </head>
 <body>
-<div id="ui">得分: <span id="score">0</span><small id="best">最佳 0</small><span id="lives" role="img" aria-label="剩余救援 3 次">♥♥♥</span><small>v1.1.6</small></div>
+<div id="ui">得分: <span id="score">0</span><small id="best">最佳 0</small><span id="lives" role="img" aria-label="剩余救援 3 次">♥♥♥</span><small>v1.4.2</small></div>
 <div id="voiceSubtitle" role="status" aria-live="polite"></div>
-<canvas id="gameCanvas" aria-label="按住蓄力，松开跳跃"></canvas>
+<canvas id="gameCanvas" aria-label="按住蓄力感知地块，松开传送跳跃"></canvas>
 <div id="gameControls">
 <button id="muteButton" type="button" aria-pressed="false" aria-label="静音">静音</button>
 <button id="landingHintButton" type="button" aria-pressed="false">落点提示：关</button>
@@ -87,7 +87,7 @@ const CFG = {
     difficultyStart: 150,         // Count forward platforms, never score/combo points.
     chargeMs: 1500,               // 蓄满所需毫秒（已调慢，手感平缓）
     jumpMin: 45,                  // 世界距离：最小跳跃
-    jumpMax: 320,                 // 世界距离：最大跳跃
+    jumpMax: 380,                 // 世界距离：最大跳跃（必须明显大于平台间距，长蓄力才真的会跳出去）
     skyHoleDrop: 250,             // 空中黑洞高度（像素，保证人物钻出时完整可见）
     fallGravity: 2900,            // 下落加速度 px/s^2
     hopH: 54,                     // 松开后小跳的高度
@@ -95,7 +95,13 @@ const CFG = {
     sinkMs: 240,                  // 小跳落回后沉入黑洞的时长
     perfectScale: 0.5,            // 完美判定（顶面菱形缩放）
     edgeScale: 1.25,              // 边缘救球判定
-    playerH: 126                  // 人物显示高度
+    playerH: 126,                 // 人物显示高度
+    senseRevealAt: 0.72,          // 蓄力到“最优跳跃距离”的 72% 时，地块显影到最大透明度
+    senseGhost: 0.05,             // 未感知时，目标地块残留的微光
+    senseFarGhost: 0.03,          // 更远地块的残留微光（只留一点方位暗示）
+    senseFadeRate: 18,            // 显影 / 消隐的平滑速度（越大越干脆）
+    idleChatter: true,            // 空置时的自言自语（interval 见 game-audio.js 的 deferIdle）
+    portalOpenMs: 420             // 黑洞从“半开”到全开的时间（起跳中完成，偏慢更清楚）
 };
 
 /* ------------------------- 画布 ------------------------- */
@@ -277,12 +283,15 @@ document.getElementById("best").textContent = "最佳 " + best;
 
 let platforms = [];             // {wx, wy, hw, hh, depth, tint, deco}
 let curIdx = 0;
-let player = { wx: 0, wy: 0, sink: 0, drop: 0, fallV: 0, squash: 0, wobble: 0, frame: 0 };
+let player = { wx: 0, wy: 0, sink: 0, drop: 0, fallV: 0, squash: 0 };
 let power = 0;                  // 0..1
+// “空间吞噬”感知：蓄力时前方地块的显影程度（0=完全透明，1=完全显形）
+const sense = { reveal: 0 };
 let jumpDir = { x: 1, y: 0 };   // 本次跳跃方向（世界轴）
 let landInfo = null;            // {plat, px, py, kind}
-let hole = { wx: 0, wy: 0, r: 0, active: false };      // 脚下传送洞
-let skyHole = { wx: 0, wy: 0, r: 0, active: false };   // 落点高空洞
+// open：黑洞开启程度（0..1）；openT：开启动画已播放的时间
+let hole = { wx: 0, wy: 0, r: 0, active: false, open: 0, openT: 0, r0: 0, open0: 0 };      // 脚下传送洞
+let skyHole = { wx: 0, wy: 0, r: 0, active: false, open: 0 };                             // 落点高空洞
 let cam = { wx: 0, wy: 0 };
 let started = false;
 let missionPlatform = null;
@@ -307,7 +316,6 @@ function newPlatform(from, dir, gap) {
     };
 }
 const routeDirections = [{ x: 0, y: -1 }, { x: -1, y: 0 }];
-let dirHistory = [];
 let routeDirection = null, routeRemaining = 0;
 function nextDir() {
     if (routeRemaining <= 0) {
@@ -319,7 +327,6 @@ function nextDir() {
     }
     routeRemaining--;
     const d = routeDirection;
-    dirHistory.push(d); if (dirHistory.length > 4) dirHistory.shift();
     return d;
 }
 function ensurePlatforms() {
@@ -339,7 +346,9 @@ function ensurePlatforms() {
         }
         platforms.push(candidate);
     }
-    if (curIdx > 2) platforms.splice(0, curIdx - 2), curIdx = 2, reindex();
+    if (curIdx > 2) platforms.splice(0, curIdx - 2), curIdx = 2;
+    // 新平台必须先算出自己的绘制深度，否则会带着 newPlatform 里的占位 0 被排序
+    reindex();
 }
 function platformsSeparated(a, b) {
     const dx = Math.abs(projX(a.wx, a.wy) - projX(b.wx, b.wy));
@@ -355,12 +364,14 @@ function reset() {
     RecordedAudio.stopVoice();
     RecordedAudio.deferIdle();
     platforms = [{ sequence: 0, easterEgg: false, wx: 0, wy: 0, hw: CFG.tileHW + 6, hh: (CFG.tileHW + 6) / 2, tint: 0, deco: -1 }];
-    dirHistory = []; routeDirection = null; routeRemaining = 0;
+    routeDirection = null; routeRemaining = 0;
     curIdx = 0;
-    ensurePlatforms(); reindex();
-    player.wx = 0; player.wy = 0; player.sink = 0; player.drop = 0; player.fallV = 0; player.squash = 0; player.wobble = 0;
+    ensurePlatforms();
+    player.wx = 0; player.wy = 0; player.sink = 0; player.drop = 0; player.fallV = 0; player.squash = 0;
     power = 0; landInfo = null;
-    hole.active = false; skyHole.active = false;
+    sense.reveal = 0;
+    hole.active = false; hole.open = 0; hole.openT = 0;
+    skyHole.active = false; skyHole.open = 0;
     cam.wx = platforms[0].wx + 40; cam.wy = platforms[0].wy - 20;
     score = 0; combo = 0;
     missionPlatform = null;
@@ -368,6 +379,7 @@ function reset() {
     document.getElementById("score").textContent = 0;
     state = ST.IDLE; stateT = 0; started = false;
     popups.length = 0; bursts.length = 0;
+    updateSense(0);
 }
 reset();
 
@@ -380,19 +392,28 @@ function pressStart() {
     if (!started) started = true;
     if (state !== ST.IDLE) return;
     state = ST.CHARGING; stateT = 0; power = 0;
+    sense.reveal = 0;
     hole.wx = player.wx; hole.wy = player.wy; hole.active = false; hole.r = 0;
+    hole.open = 0; hole.openT = 0;
     SFX.charge();
 }
 function pressEnd() {
     if (state !== ST.CHARGING) return;
-    if (power < 0.06) { state = ST.IDLE; hole.active = false; player.sink = 0; return; }  // 轻点取消
+    if (power < 0.06) { state = ST.IDLE; hole.active = false; player.sink = 0; sense.reveal = 0; return; }  // 轻点取消
     if (!rabbitForm && platforms[curIdx].sequence >= CFG.rescueSuccessPlatform) rabbitTransformPending = true;
     if (missionPlatform) {
         missionPlatform.easterEgg = false;
         missionPlatform = null;
     }
     state = ST.HOP; stateT = 0;                     // 先小跳一下
-    hole.wx = player.wx; hole.wy = player.wy; hole.active = true; hole.r = 0.95;
+    hole.wx = player.wx; hole.wy = player.wy;
+    hole.active = true;
+    // 记下蓄力时洞口的大小/开启程度，接下来由起跳动作把它撑开到全开
+    hole.r0 = hole.r;
+    hole.open0 = hole.open;
+    hole.openT = 0;
+    // 松手的瞬间方位已经锁定：目标地块直接显形，方便看清落点。
+    sense.reveal = 1;
     jumpDir = nextDirForJump();
     SFX.hop();
 }
@@ -409,7 +430,10 @@ function playerFacing() {
 }
 let activePointer = null, keyboardHeld = false;
 function cancelCharge() {
-    if (state === ST.CHARGING) { state = ST.IDLE; stateT = 0; power = 0; hole.active = false; player.sink = 0; }
+    if (state === ST.CHARGING) {
+        state = ST.IDLE; stateT = 0; power = 0; hole.active = false; player.sink = 0;
+        sense.reveal = 0;
+    }
     RecordedAudio.stopVoice();
     RecordedAudio.deferIdle();
 }
@@ -495,23 +519,48 @@ function findLanding(wx, wy) {
 }
 const jumpDist = () => CFG.jumpMin + power * (CFG.jumpMax - CFG.jumpMin);
 
+/* ------------------------- 空间吞噬 · 感知 ------------------------- */
+// 到下一块平台的“最优跳跃距离”（正中落点）。与跳跃距离用同一套度量：
+// 方向向量在跳跃时按 |dx|+|dy| 归一，所以最优距离就是世界差的 L1 长度。
+function nextJumpDistance() {
+    const nxt = platforms[curIdx + 1];
+    if (!nxt) return CFG.jumpMax;
+    return Math.abs(nxt.wx - player.wx) + Math.abs(nxt.wy - player.wy);
+}
+function optimalPower() {
+    return clamp((nextJumpDistance() - CFG.jumpMin) / (CFG.jumpMax - CFG.jumpMin), 1e-3, 1);
+}
+// 地块显影曲线：在最优跳跃距离之前（默认 72% 处）就封顶到最大透明度，
+// 之后继续蓄力，地块不再变亮——方位感只在“接近正确距离”之前提供线索。
+function senseRevealFor(powerValue) {
+    const threshold = Math.max(optimalPower() * CFG.senseRevealAt, 1e-4);
+    const t = clamp(powerValue / threshold, 0, 1);
+    return t * t * (3 - 2 * t);
+}
+function updateSense(dt) {
+    const base = CFG.senseGhost;
+    const k = dt > 0 ? 1 - Math.exp(-CFG.senseFadeRate * dt) : 0;
+    for (let i = 0; i < platforms.length; i++) {
+        const p = platforms[i];
+        let target;
+        if (i < curIdx) target = 0;                                             // 已被吞噬：隐去
+        else if (i === curIdx) target = 1;                                      // 脚下这块：已知
+        else if (i === curIdx + 1) target = base + (1 - base) * sense.reveal;   // 目标：靠蓄力感知显形
+        else target = CFG.senseFarGhost;                                        // 更远处：仅剩微光
+        if (p.vis === undefined) p.vis = target;
+        else p.vis += (target - p.vis) * k;
+    }
+}
+
 /* ------------------------- 更新 ------------------------- */
 function update(dt) {
     rabbitSubtitleTime = Math.max(0, rabbitSubtitleTime - dt);
-    RecordedAudio.tick(state === ST.IDLE && started);
+    RecordedAudio.tick(CFG.idleChatter && state === ST.IDLE && started);
     stateT += dt;
     if (rescueMotion) {
         rescueMotion.t = Math.min(1, rescueMotion.t + dt / .48);
         const a = rescueMotion.t * rescueMotion.t * (3 - 2 * rescueMotion.t);
-        if (rescueMotion.type === "extend") {
-            rescueMotion.plat.extension.progress = a;
-        } else {
-            for (const item of rescueMotion.items) {
-                item.plat.wx = item.wx + rescueMotion.dx * a;
-                item.plat.wy = item.wy + rescueMotion.dy * a;
-            }
-            reindex();
-        }
+        rescueMotion.plat.extension.progress = a;
         if (rescueMotion.t >= 1) rescueMotion = null;
     }
     // 相机目标
@@ -528,11 +577,22 @@ function update(dt) {
     switch (state) {
         case ST.CHARGING: {
             power = clamp(stateT * 1000 / CFG.chargeMs, 0, 1);
-            hole.active = false; hole.r = 0;
+            // 蓄力即“感知”：地块随着蓄力逐渐显形，达到阈值后透明度的变化到此为止。
+            // 封顶不发声、不闪烁——任何“这一刻到了”的提示都会让时机变得好判断。
+            sense.reveal = senseRevealFor(power);
+            // 脚下的黑色传送门随蓄力缓缓撑开
+            hole.active = power > 0.1;
+            hole.r = hole.active ? 0.14 + 0.36 * power * power : 0;
+            hole.open = hole.active ? 0.10 + 0.24 * power : 0;
             break;
         }
         case ST.HOP: {
-            hole.r = 0.95;
+            // 起跳时把黑洞从半开慢慢撑到全开；开启动画跨过起跳和下沉两段
+            hole.openT += dt;
+            const k = clamp(stateT * 1000 / CFG.hopMs, 0, 1);
+            hole.r = lerp(hole.r0 || 0.3, 0.95, k * k * (3 - 2 * k));
+            const ok = clamp(hole.openT * 1000 / CFG.portalOpenMs, 0, 1);
+            hole.open = lerp(hole.open0 || 0.15, 1, ok * ok * (3 - 2 * ok));
             if (stateT * 1000 >= CFG.hopMs) { state = ST.SINK; stateT = 0; SFX.portal(); }
             break;
         }
@@ -541,6 +601,9 @@ function update(dt) {
             const progress = clamp(stateT * 1000 / CFG.sinkMs, 0, 1);
             player.sink = (CFG.playerH + 32) * progress * progress;
             hole.r = 0.95;
+            hole.openT += dt;
+            const ok = clamp(hole.openT * 1000 / CFG.portalOpenMs, 0, 1);
+            hole.open = lerp(hole.open0 || 0.15, 1, ok * ok * (3 - 2 * ok));
             if (stateT * 1000 > CFG.sinkMs) {
                 // 计算落点
                 const d = jumpDist();
@@ -549,15 +612,21 @@ function update(dt) {
                 landInfo = { plat: res.plat, px: lwx, py: lwy, kind: res.kind };
                 prepareRescue(landInfo);
                 player.wx = lwx; player.wy = lwy;      // 水平位置同步到落点，垂直由 drop 控制
-                skyHole.wx = lwx; skyHole.wy = lwy; skyHole.active = true; skyHole.r = 1;
+                skyHole.wx = lwx; skyHole.wy = lwy; skyHole.active = true;
+                // 出口黑洞同样是从一点慢慢撑开，而不是凭空出现
+                skyHole.r = 0.12; skyHole.open = 1;
                 state = ST.HOLE_OPEN; stateT = 0;
                 SFX.drop();
             }
             break;
         }
         case ST.HOLE_OPEN: {
-            skyHole.r = 1;
-            hole.active = false;      // 脚下旧洞收拢
+            const kr = clamp(stateT / 0.22, 0, 1);
+            skyHole.r = lerp(0.12, 1, kr * kr * (3 - 2 * kr));
+            // 入口在把人吞进去之后缓缓收拢，和开洞是同一套节奏
+            const kc = clamp(stateT / 0.26, 0, 1);
+            hole.r = 0.95 * (1 - kc * kc * (3 - 2 * kc));
+            if (hole.r <= 0.02) hole.active = false;
             if (stateT > 0.3) {
                 // Switch only after the original body is hidden in the entrance.
                 if (rabbitTransformPending) {
@@ -578,7 +647,6 @@ function update(dt) {
         }
         case ST.LAND: {
             player.squash = Math.max(0, player.squash - dt * 4.2);
-            player.wobble *= Math.pow(0.02, dt);
             if (landInfo && landInfo.extended) {
                 // Cross the rescued ledge before the next jump so its original distance stays reachable.
                 const t = clamp(stateT / .34, 0, 1), a = t * t * (3 - 2 * t);
@@ -615,30 +683,23 @@ function update(dt) {
         if (p.t > p.life) popups.splice(i, 1);
     }
     for (const m of dust) { m.y -= m.v * dt * 8; m.p += dt; if (m.y < -0.05) { m.y = 1.05; m.x = Math.random(); } }
+    updateSense(dt);
 }
 
+// 跳短和跳远一视同仁：都让目标平台朝角色脚下“伸出一块”把人接住，扣一条命。
+// 只有命已经为 0 时才救不回来，角色直接坠落。
 function prepareRescue(info) {
     if (info.plat || info.rescued || lives <= 0) return false;
     const target = platforms[curIdx + 1];
     if (!target) return false;
     lives--; syncLives();
-    const origin = platforms[curIdx];
-    const routeX = target.wx - origin.wx, routeY = target.wy - origin.wy;
-    const shortfall = (info.px - target.wx) * routeX + (info.py - target.wy) * routeY < 0;
-    if (shortfall) {
-        // Sweep the target's surface toward the feet, anchored at its original center.
-        const d = screenDelta(target, info.px, info.py);
-        const distance = Math.abs(d.dx) / target.hw + Math.abs(d.dy) / target.hh;
-        const length = Math.max(0, 1 - .65 / Math.max(distance, .001));
-        target.extension = { dx: d.dx * length, dy: d.dy * length, progress: 0 };
-        rescueMotion = { type: "extend", t: 0, plat: target };
-        info.extended = true;
-    } else {
-        rescueMotion = {
-            type: "move", t: 0, dx: info.px - target.wx, dy: info.py - target.wy,
-            items: platforms.slice(curIdx + 1).map(p => ({ plat: p, wx: p.wx, wy: p.wy }))
-        };
-    }
+    // Sweep the target's surface toward the feet — 往角色那一侧扫出去，正反方向通用。
+    const d = screenDelta(target, info.px, info.py);
+    const distance = Math.abs(d.dx) / target.hw + Math.abs(d.dy) / target.hh;
+    const length = Math.max(0, 1 - .25 / Math.max(distance, .001));
+    target.extension = { dx: d.dx * length, dy: d.dy * length, progress: 0 };
+    rescueMotion = { t: 0, plat: target };
+    info.extended = true;
     info.plat = target; info.kind = "rescue"; info.rescued = true;
     return true;
 }
@@ -648,18 +709,10 @@ function resolveLanding() {
     // Recheck at the actual contact frame, including late or resumed landings.
     if (!info.plat) prepareRescue(info);
     if (info.rescued && rescueMotion) {
-        if (rescueMotion.type === "extend") {
-            rescueMotion.plat.extension.progress = 1;
-        } else {
-            for (const item of rescueMotion.items) {
-                item.plat.wx = item.wx + rescueMotion.dx;
-                item.plat.wy = item.wy + rescueMotion.dy;
-            }
-            reindex();
-        }
+        rescueMotion.plat.extension.progress = 1;
         rescueMotion = null;
     }
-    if (!info.plat) { state = ST.DYING; stateT = 0; player.fallV = 300; SFX.fail(); return; }
+    if (!info.plat) { state = ST.DYING; stateT = 0; player.fallV = 300; sense.reveal = 0; SFX.fail(); return; }
     const p = info.plat;
     if (p.easterEgg || p.sequence === CFG.rescueSuccessPlatform) missionPlatform = p;
     // 落点收拢：向平台中心迈半步，消解上一跳遗留的横向偏移（容错手感）
@@ -696,6 +749,8 @@ function resolveLanding() {
     } else {
         popup("原地踏步", "#9aa6b4");
     }
+    // 落点已成为脚下的已知地块，前方重新回到未知，等待下一次感知。
+    sense.reveal = 0;
 }
 function popup(text, color) { popups.push({ text, color, x: VW / 2, y: VH * 0.34, t: 0, life: 1.1 }); }
 function dustBurst(sp, n) {
@@ -775,11 +830,16 @@ function platformOutline(p) {
     lower.pop(); upper.pop();
     return lower.concat(upper);
 }
-function drawPlatform(p, t) {
+function drawPlatform(p, t, alpha, isTarget) {
+    if (alpha <= 0.012) return;
     const s = projOf(p.wx, p.wy);
     const hw = p.hw, hh = p.hh, D = CFG.tileDepth;
     const base = 168 + p.tint;
     const outline = platformOutline(p);
+    // 感知光晕：地块还没显形时，先让空间里泛起一点“有东西”的微光
+    if (isTarget) drawSenseHalo(p, t);
+    ctx.save();
+    ctx.globalAlpha = alpha;
     // Front-facing side walls follow the same extended outline as the top.
     for (let i=0;i<outline.length;i++) {
         const a=outline[i], b=outline[(i+1)%outline.length];
@@ -817,35 +877,73 @@ function drawPlatform(p, t) {
         ctx.beginPath(); ctx.ellipse(s.x - hw * .4, s.y + hh * .2, 7, 4, 0, 0, 7); ctx.fill();
         ctx.beginPath(); ctx.ellipse(s.x - hw * .28, s.y + hh * .38, 4.5, 2.6, 0, 0, 7); ctx.fill();
     }
+    ctx.restore();
 }
-function drawEasterEgg(p) {
-    if (!p.easterEgg || !easterEggReady) return;
+// 目标地块的“感知”光晕：随显影变强，未感知时只留极淡的存在感
+function drawSenseHalo(p, t) {
+    const s = projOf(p.wx, p.wy);
+    const pulse = .5 + .5 * Math.sin(t * 2.6 + p.wx * .02);
+    const strength = .045 + .15 * sense.reveal + .02 * pulse;
+    const r = p.hw * (1.55 + .35 * sense.reveal);
+    const g = ctx.createRadialGradient(s.x, s.y, p.hw * .12, s.x, s.y, r);
+    g.addColorStop(0, "rgba(120,235,208," + (strength * .9).toFixed(3) + ")");
+    g.addColorStop(.55, "rgba(96,190,220," + (strength * .38).toFixed(3) + ")");
+    g.addColorStop(1, "rgba(90,180,215,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.ellipse(s.x, s.y, r, r * .55, 0, 0, 7); ctx.fill();
+}
+function drawEasterEgg(p, alpha) {
+    if (!p.easterEgg || !easterEggReady || alpha <= 0.012) return;
     const s = projOf(p.wx, p.wy);
     const width = Math.min(136, p.hw * 1.3);
     const height = width * easterEggImage.naturalHeight / easterEggImage.naturalWidth;
     // Rest on the back of the platform; keep its landing area and physics unchanged.
+    ctx.save();
+    ctx.globalAlpha = alpha;
     ctx.drawImage(easterEggImage, s.x - width / 2 + p.hw * .12,
         s.y - p.hh * .18 - height, width, height);
+    ctx.restore();
 }
-function drawNextHint(t) {
+
+/* ------------------------- 绘制：目标平台的感知框 ------------------------- */
+// 远端平台外圈的三重实线：蓄力的第一帧就在，随蓄力连续长大（0→1 全程不停），
+// 亮度和尺寸都不会在中途停住或跳变，所以它只表达“正在蓄力/正在感知”，
+// 不会变成“现在刚好”的刻度——但按住期间始终有由内向外荡开的呼吸，永远“活着”。
+function drawTargetFrame(t) {
+    if (state !== ST.CHARGING) return;
     const nxt = platforms[curIdx + 1];
-    if (!nxt || state === ST.OVER) return;
+    if (!nxt) return;
     const s = projOf(nxt.wx, nxt.wy);
-    const a = .22 + .14 * Math.sin(t * 3);
-    ctx.strokeStyle = "rgba(140,230,210," + a.toFixed(3) + ")";
-    ctx.lineWidth = 2; ctx.setLineDash([7, 7]); ctx.lineDashOffset = -t * 26;
-    ctx.beginPath();
-    ctx.moveTo(s.x, s.y - nxt.hh * .9); ctx.lineTo(s.x + nxt.hw * .9, s.y); ctx.lineTo(s.x, s.y + nxt.hh * .9); ctx.lineTo(s.x - nxt.hw * .9, s.y);
-    ctx.closePath(); ctx.stroke();
-    ctx.setLineDash([]);
+    const hw = nxt.hw * (0.5 + 0.8 * power);
+    const hh = hw * .5;
+    ctx.save();
+    ctx.globalAlpha = clamp(stateT / 0.12, 0, 1);      // 按下瞬间的极短渐入，避免硬闪
+    const rings = [[1, .34, 2], [1.13, .19, 1.4], [1.26, .10, 1]];
+    for (let i = 0; i < rings.length; i++) {
+        const phase = t * 2.6 - i * 0.85;              // 由内向外传的呼吸波
+        const k = rings[i][0] * (1 + .05 * Math.sin(phase));
+        const a = rings[i][1] * (.78 + .22 * Math.sin(phase));
+        const x = hw * k, y = hh * k;
+        ctx.strokeStyle = "rgba(126,240,200," + a.toFixed(3) + ")";
+        ctx.lineWidth = rings[i][2];
+        ctx.beginPath();
+        ctx.moveTo(s.x, s.y - y); ctx.lineTo(s.x + x, s.y);
+        ctx.lineTo(s.x, s.y + y); ctx.lineTo(s.x - x, s.y);
+        ctx.closePath(); ctx.stroke();
+    }
+    ctx.restore();
 }
 
 /* ------------------------- 绘制：传送洞 ------------------------- */
-function drawHole(wx, wy, r, t, frontOnly, yOff) {
-    if (r <= 0.01) return;
-    const s = projOf(wx, wy);
+// h: {wx, wy, r, open, active}
+// open 是开启动画进度（0..1）：蓄力时只撑开一点点，起跳时慢慢撑到全开。
+// 黑洞周围不加任何光晕/能量环/粒子，本体就是一个干净的黑色椭圆。
+function drawHole(h, frontOnly, yOff) {
+    if (!h.active || h.r <= 0.01) return;
+    const s = projOf(h.wx, h.wy);
     s.y += yOff || 0;
-    const rx = 62 * r, ry = 31 * r;
+    const open = clamp(h.open === undefined ? 1 : h.open, 0, 1);
+    const rx = 62 * h.r * (0.55 + 0.45 * open), ry = 31 * h.r * (0.55 + 0.45 * open);
     ctx.save();
     if (frontOnly) {
         ctx.beginPath();
@@ -864,16 +962,16 @@ function hopOffset() {
     const ht = clamp(stateT * 1000 / CFG.hopMs, 0, 1);
     return -4 * CFG.hopH * ht * (1 - ht);          // 小跳抛物线偏移
 }
-function drawPlayer(t) {
+function drawPlayer() {
     if (state === ST.HOLE_OPEN || state === ST.OVER) return;   // 已沉入洞中 / 局终隐藏
     const s = projOf(player.wx, player.wy);
     let fy = s.y;                                   // 脚底屏幕 y
     if (state === ST.HOP) fy += hopOffset();        // 小跳抛物线
     if (state === ST.SINK) fy += player.sink;       // 沉入黑洞
-    if (state === ST.FALLING || state === ST.DYING || state === ST.HOLE_OPEN) fy += player.drop;
+    if (state === ST.FALLING || state === ST.DYING) fy += player.drop;
 
     // 影子
-    if (state !== ST.DYING && state !== ST.OVER && state !== ST.SINK) {
+    if (state !== ST.DYING && state !== ST.SINK) {
         const hAbove = clamp(-(fy - s.y), -200, 400);
         const sh = clamp(1 - hAbove / 420, .18, 1);
         ctx.fillStyle = "rgba(0,0,0," + (.34 * sh).toFixed(2) + ")";
@@ -887,11 +985,9 @@ function drawPlayer(t) {
     else if (state === ST.HOP) fi = stateT * 1000 < CFG.hopMs * 0.5 ? 2 : 1;
     else if (state === ST.FALLING || state === ST.DYING) fi = player.drop < -CFG.skyHoleDrop * 0.45 ? 2 : 3;
     else if (state === ST.LAND) fi = 4;
-    player.frame = fi;
 
     const H = CFG.playerH;
     let sq = 1, st = 1;
-    if (state === ST.CHARGING) { sq = 1; st = 1; }   // 只蹲不坠
     if (state === ST.HOP) { sq = 1.05; st = .96; }
     if (state === ST.LAND) { sq = 1 - player.squash * .22; st = 1 + player.squash * .16; }
     if (state === ST.FALLING) { sq = 1.06; st = .95; }
@@ -912,7 +1008,6 @@ function drawPlayer(t) {
         ctx.clip();
     }
     ctx.translate(s.x, fy);
-    if (player.wobble > 0.01) ctx.rotate(Math.sin(stateT * 22) * .07 * player.wobble);
     ctx.scale(st * playerFacing(), sq);
 
     const activeSprite = rabbitForm && rabbitSprite.ready ? rabbitSprite.image : sprite;
@@ -987,7 +1082,7 @@ function drawPopups() {
         ctx.globalAlpha = clamp(a * 1.4, 0, 1);
         ctx.shadowColor = "rgba(0,0,0,.8)"; ctx.shadowBlur = 8;
         ctx.fillText(p.text, p.x, p.y);
-        ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+        ctx.shadowBlur = 0; ctx.shadowColor = "transparent"; ctx.globalAlpha = 1;
     }
 }
 function drawOverlay(t) {
@@ -1004,10 +1099,12 @@ function drawOverlay(t) {
         ctx.textAlign = "center";
         ctx.fillStyle = "rgba(238,243,248," + (.6 + .3 * Math.sin(t * 2.6)).toFixed(2) + ")";
         ctx.font = "bold " + Math.max(24, 20 / viewScale) + "px 'PingFang SC','Microsoft YaHei',Arial";
-        ctx.fillText("按住蓄力 · 松开传送", VW / 2, VH * 0.78, VW * .9);
+        ctx.fillText("按住蓄力 · 感知黑洞 · 松开传送", VW / 2, VH * 0.78, VW * .9);
         ctx.font = Math.max(14, 12 / viewScale) + "px 'PingFang SC','Microsoft YaHei',Arial";
         ctx.fillStyle = "rgba(238,243,248,.45)";
-        ctx.fillText("蓄得越久跳得越远 · 落在平台中心可得 PERFECT", VW / 2, VH * 0.78 + Math.max(26, 26 / viewScale), VW * .9);
+        const subY = VH * 0.78 + Math.max(26, 26 / viewScale);
+        ctx.fillText("地块随蓄力显形，显形后仍可继续蓄力", VW / 2, subY, VW * .9);
+        ctx.fillText("落在平台中心可得 PERFECT", VW / 2, subY + Math.max(22, 20 / viewScale), VW * .9);
     }
     if (state === ST.OVER) {
         ctx.fillStyle = "rgba(8,10,13,.72)"; ctx.fillRect(0, 0, VW, VH);
@@ -1022,8 +1119,6 @@ function drawOverlay(t) {
         ctx.fillStyle = "rgba(238,243,248," + (.5 + .35 * Math.sin(t * 3)).toFixed(2) + ")";
         ctx.fillText("点击 / 空格 再来一次", VW / 2, VH * 0.42 + 92);
     }
-    // 静音标识
-
 }
 
 /* ------------------------- 主渲染 ------------------------- */
@@ -1032,29 +1127,38 @@ function render(t) {
 
     // 深度排序绘制列表
     const list = [];
-    for (const p of platforms) {
-        list.push({ d: p.depth, fn: () => drawPlatform(p, t) });
-        if (p.easterEgg) list.push({ d: p.depth + 0.015, fn: () => drawEasterEgg(p) });
+    for (let i = 0; i < platforms.length; i++) {
+        const p = platforms[i];
+        const vis = p.vis === undefined ? 0 : p.vis;
+        const isTarget = i === curIdx + 1;
+        // 没被感知的地块几乎是透明的，只有脚下这块和刚感知到的目标才完整绘制
+        if (vis > 0.012 || isTarget) {
+            list.push({ d: p.depth, fn: () => drawPlatform(p, t, vis, isTarget) });
+            if (p.easterEgg) list.push({ d: p.depth + 0.015, fn: () => drawEasterEgg(p, vis) });
+        }
     }
-    list.push({ d: platforms[curIdx].depth + 0.01, fn: () => drawNextHint(t) });
+    // 目标平台外圈的感知框：放在平台自己的深度上，平台离得近时会正确遮挡它
+    const nxtPlat = platforms[curIdx + 1];
+    if (nxtPlat) list.push({ d: nxtPlat.depth + 0.005, fn: () => drawTargetFrame(t) });
     const groundD = platforms[curIdx].depth;
     if (hole.active) {
-        list.push({ d: groundD + 0.02, fn: () => drawHole(hole.wx, hole.wy, hole.r, t, false) });
-        list.push({ d: groundD + 0.05, fn: () => drawHole(hole.wx, hole.wy, hole.r, t, true) });
+        list.push({ d: groundD + 0.02, fn: () => drawHole(hole, false) });
+        list.push({ d: groundD + 0.05, fn: () => drawHole(hole, true) });
     }
-    // 人物深度取“所站/所落平台”，避免落点偏移导致深度反转而穿模
     const airPlat = (state === ST.FALLING || state === ST.HOLE_OPEN || state === ST.DYING) && landInfo && landInfo.plat
         ? landInfo.plat : platforms[curIdx];
+    // 深度：站在/落在平台上时永远压在平台之上（否则会被自己脚下那块挡住）；
+    // 只有坠入虚空时才按真实世界位置排序，这样越过平台的坠落会被平台遮住。
+    const grounded = state === ST.IDLE || state === ST.CHARGING || state === ST.HOP || state === ST.SINK || state === ST.LAND;
+    const playerDepth = grounded ? platforms[curIdx].depth + 0.03
+        : state === ST.FALLING ? Math.max(player.wx + player.wy, airPlat.depth + 0.03)
+        : player.wx + player.wy;
     if (skyHole.active) {
-        list.push({ d: airPlat.depth + 0.025, fn: () => drawHole(skyHole.wx, skyHole.wy, skyHole.r, t, false, -CFG.skyHoleDrop) });
+        list.push({ d: airPlat.depth + 0.025, fn: () => drawHole(skyHole, false, -CFG.skyHoleDrop) });
     }
-    list.push({ d: airPlat.depth + 0.03, fn: () => drawPlayer(t) });
+    list.push({ d: playerDepth, fn: () => drawPlayer() });
     list.sort((a, b) => a.d - b.d);
     for (const it of list) it.fn();
-
-    // 空中黑洞：出现在落点平台正上方的高空，人物从这里坠落
-    // The exit is behind the player: reveal at its center plane,
-    // without a second half-ellipse pushing the silhouette to the lower rim.
 
     // 粒子
     for (const b of bursts) {
